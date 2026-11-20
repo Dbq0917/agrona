@@ -18,6 +18,8 @@ package org.agrona.concurrent.ringbuffer;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.*;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * Ring-buffer for the concurrent exchanging of binary encoded messages from producer(s) to consumer(s)
  * in a FIFO manner.
@@ -76,6 +78,117 @@ public interface RingBuffer
      * @throws IllegalArgumentException if the {@code length} is negative or is greater than {@link #maxMsgLength()}.
      */
     boolean write(int msgTypeId, DirectBuffer srcBuffer, int offset, int length);
+
+    /**
+     * Write a message, applying bounded back-pressure while the ring-buffer does not have enough free capacity.
+     * <p>
+     * Instead of overwriting unread records (which would expose the consumer to torn messages) or spinning forever
+     * when the consumer is stalled (e.g. during a restart), this method polls the consumer position published in the
+     * ring-buffer trailer and idles for at most {@code timeout} units of time before giving up. The calling thread is
+     * therefore guaranteed never to block indefinitely: a timeout or an interrupt results in a graceful failure
+     * return rather than a hung producer.
+     *
+     * @param msgTypeId type of the message encoding.
+     * @param srcBuffer containing the encoded binary message.
+     * @param offset    at which the encoded message begins.
+     * @param length    of the encoded message in bytes.
+     * @param idleStrategy strategy used to back off (spin/yield/park) between retries while the buffer is full.
+     * @param timeout   maximum time to wait for capacity, must be non-negative.
+     * @param unit      time unit of the timeout.
+     * @return true if the message was written, false if the timeout elapsed or the thread was interrupted first.
+     * @throws IllegalArgumentException if the {@code length} is negative or is greater than {@link #maxMsgLength()}.
+     * @see #write(int, DirectBuffer, int, int)
+     */
+    default boolean write(
+        final int msgTypeId,
+        final DirectBuffer srcBuffer,
+        final int offset,
+        final int length,
+        final IdleStrategy idleStrategy,
+        final long timeout,
+        final TimeUnit unit)
+    {
+        if (write(msgTypeId, srcBuffer, offset, length))
+        {
+            return true;
+        }
+
+        final long deadlineNs = System.nanoTime() + unit.toNanos(timeout);
+        idleStrategy.reset();
+
+        while (System.nanoTime() - deadlineNs < 0)
+        {
+            if (Thread.currentThread().isInterrupted())
+            {
+                return false;
+            }
+
+            idleStrategy.idle();
+
+            if (write(msgTypeId, srcBuffer, offset, length))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Try to claim a space applying bounded back-pressure while the ring-buffer does not have enough free capacity.
+     * <p>
+     * Behaves like {@link #tryClaim(int, int)} but, instead of returning {@link #INSUFFICIENT_CAPACITY} immediately,
+     * polls the consumer position and idles for at most {@code timeout} units of time for space to become available.
+     * The wait is bounded so the producer thread can never hang on a stalled or restarting consumer.
+     *
+     * @param msgTypeId type of the message encoding. Will be written into the header upon successful claim.
+     * @param length    of the claim in bytes. A claim length cannot be greater than {@link #maxMsgLength()}.
+     * @param idleStrategy strategy used to back off (spin/yield/park) between retries while the buffer is full.
+     * @param timeout   maximum time to wait for capacity, must be non-negative.
+     * @param unit      time unit of the timeout.
+     * @return a non-zero index into the underlying ring-buffer at which encoded message begins,
+     * {@link #INSUFFICIENT_CAPACITY} if the timeout elapsed or the thread was interrupted before space became
+     * available.
+     * @throws IllegalArgumentException if the {@code msgTypeId} is less than {@code 1}.
+     * @throws IllegalArgumentException if the {@code length} is negative or is greater than {@link #maxMsgLength()}.
+     * @see #tryClaim(int, int)
+     * @see #commit(int)
+     * @see #abort(int)
+     */
+    default int tryClaim(
+        final int msgTypeId,
+        final int length,
+        final IdleStrategy idleStrategy,
+        final long timeout,
+        final TimeUnit unit)
+    {
+        int index = tryClaim(msgTypeId, length);
+        if (INSUFFICIENT_CAPACITY != index)
+        {
+            return index;
+        }
+
+        final long deadlineNs = System.nanoTime() + unit.toNanos(timeout);
+        idleStrategy.reset();
+
+        while (System.nanoTime() - deadlineNs < 0)
+        {
+            if (Thread.currentThread().isInterrupted())
+            {
+                return INSUFFICIENT_CAPACITY;
+            }
+
+            idleStrategy.idle();
+
+            index = tryClaim(msgTypeId, length);
+            if (INSUFFICIENT_CAPACITY != index)
+            {
+                return index;
+            }
+        }
+
+        return INSUFFICIENT_CAPACITY;
+    }
 
     /**
      * Try to claim a space in the underlying ring-buffer into which a message can be written with zero copy semantics.
@@ -303,4 +416,65 @@ public interface RingBuffer
      * @return true of an unblocking action was taken otherwise false.
      */
     boolean unblock();
+
+    /**
+     * Remaining free capacity in bytes that can still be claimed without the consumer having to advance.
+     * <p>
+     * Because at most one record header of padding is reserved when a record would wrap, a producer must leave
+     * {@link RecordDescriptor#HEADER_LENGTH} bytes of headroom; values returned here are therefore clamped at
+     * {@code capacity - HEADER_LENGTH}. The value is a concurrent snapshot and only an indication.
+     *
+     * @return number of free bytes currently available in the ring-buffer.
+     */
+    default int remainingCapacity()
+    {
+        return Math.max(0, capacity() - size() - RecordDescriptor.HEADER_LENGTH);
+    }
+
+    /**
+     * Determine whether the buffered backlog has reached or crossed a high water mark expressed as a fraction of
+     * the ring-buffer capacity. Producers can use this to throttle themselves before the buffer becomes full,
+     * i.e. before any back-pressure wait is required.
+     *
+     * @param highWatermarkRatio fraction of capacity at which the producer should slow down, in the range
+     *                           {@code [0.0, 1.0]}.
+     * @return true when {@link #size()} is at least {@code highWatermarkRatio * capacity()}.
+     * @throws IllegalArgumentException if the ratio is outside of the {@code [0.0, 1.0]} range.
+     */
+    default boolean isAtHighWatermark(final double highWatermarkRatio)
+    {
+        if (highWatermarkRatio < 0.0 || highWatermarkRatio > 1.0)
+        {
+            throw new IllegalArgumentException(
+                "highWatermarkRatio must be in the [0.0, 1.0] range: " + highWatermarkRatio);
+        }
+
+        return size() >= (long)(capacity() * highWatermarkRatio);
+    }
+
+    /**
+     * Determine whether the consumer is making progress, allowing a producer to fail fast instead of waiting out
+     * the full back-pressure timeout when a consumer has crashed or is being restarted.
+     * <p>
+     * The check uses the last consumer heartbeat set via {@link #consumerHeartbeatTime(long)}; the supplied time
+     * must come from a clock that is valid across processes, never {@link System#nanoTime()}. A heartbeat older
+     * than {@code maxHeartbeatAge} means the consumer is considered stalled; callers that also want to distinguish
+     * "slow but alive" from "dead" can additionally poll {@link #consumerPosition()} and treat a moving position
+     * as progress. A zero heartbeat means no heartbeat has ever been published and liveness is unknown, in which
+     * case this method reports the consumer as alive so callers never fail spuriously.
+     *
+     * @param nowMs           current wall clock time in milliseconds.
+     * @param maxHeartbeatAge maximum tolerated heartbeat age in milliseconds.
+     * @return true if the consumer is alive or its liveness cannot be determined, false if it appears stalled.
+     */
+    default boolean isConsumerAlive(final long nowMs, final long maxHeartbeatAge)
+    {
+        final long heartbeatTime = consumerHeartbeatTime();
+        if (0L == heartbeatTime)
+        {
+            return true;
+        }
+
+        return nowMs - heartbeatTime <= maxHeartbeatAge;
+    }
 }
